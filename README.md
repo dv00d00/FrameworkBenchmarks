@@ -1,182 +1,97 @@
-# Web Framework Performance Comparison
 
-This project provides representative performance measures across a wide field of web application frameworks. With much help from the community, coverage is quite broad and we are happy to broaden it further with contributions. The project presently includes frameworks on many languages including Go, Python, Java, Ruby, PHP, Clojure, Groovy, JavaScript, Erlang, Haskell, Scala, Lua, and C.  The current tests exercise plaintext responses, JSON seralization, database reads and writes via the object-relational mapper (ORM), collections, sorting, server-side templates, and XSS counter-measures.  Future tests will exercise other components and greater computation.
+# Welcome to [TechEmpower Framework Benchmarks (TFB)](http://www.techempower.com/benchmarks/) 
+[![Build Status](https://travis-ci.org/TechEmpower/FrameworkBenchmarks.svg?branch=master)](https://travis-ci.org/TechEmpower/FrameworkBenchmarks) 
+[![Documentation Status](https://readthedocs.org/projects/frameworkbenchmarks/badge/?version=latest)](https://readthedocs.org/projects/frameworkbenchmarks/?badge=latest)
+[![Issue Stats](http://www.issuestats.com/github/TechEmpower/FrameworkBenchmarks/badge/issue?style=flat)](http://www.issuestats.com/github/TechEmpower/FrameworkBenchmarks)
+[![Issue Stats](http://www.issuestats.com/github/TechEmpower/FrameworkBenchmarks/badge/pr?style=flat)](http://www.issuestats.com/github/TechEmpower/FrameworkBenchmarks)
 
-Read more and see the results of our tests on Amazon EC2 and physical hardware at http://www.techempower.com/benchmarks/
+If you're new to the project, welcome! Please feel free to ask questions [here](https://github.com/TechEmpower/FrameworkBenchmarks/issues/2978). We encourage new frameworks and contributors to ask questions. We're here to help!
 
-Join in the conversation at our Google Group: https://groups.google.com/forum/?fromgroups=#!forum/framework-benchmarks
+This project provides representative performance measures across a wide field of web application frameworks. With much help from the community, coverage is quite broad and we are happy to broaden it further with contributions. The project presently includes frameworks on many languages including `Go`, `Python`, `Java`, `Ruby`, `PHP`, `C#`, `Clojure`, `Groovy`, `Dart`, `JavaScript`, `Erlang`, `Haskell`, `Scala`, `Perl`, `Lua`, `C`, and others.  The current tests exercise plaintext responses, JSON seralization, database reads and writes via the object-relational mapper (ORM), collections, sorting, server-side templates, and XSS counter-measures. Future tests will exercise other components and greater computation.
 
-## Running the test suite
+[Read more and see the results of our tests on cloud and physical hardware](http://www.techempower.com/benchmarks/). For descriptions of the test types that we run, see the 
+[test requirements section](https://frameworkbenchmarks.readthedocs.org/en/latest/Project-Information/Framework-Tests/).
 
-We ran our tests using two dedicated i7 2600k machines as well as two EC2 m1.large instances.
+If you find yourself in a directory or file that you're not sure what the purpose is, checkout our [file structure](http://frameworkbenchmarks.readthedocs.org/en/latest/Codebase/#file-structure) in our documenation, which will briefly explain the use of relevant directories and files.
 
-On the [Benchmark Tools README file](toolset/README.md) you will find tools and instructions to replicate our tests using EC2, Windows Azure or your own dedicated machines.
+## Quick Start Guide
 
-## Updating Tests
+To get started developing you'll need to install [docker](https://docs.docker.com/install/) or see our [Quick Start Guide using vagrant](.#quick-start-guide-(vagrant))
 
-We hope that the community will help us in making these tests better, so if you'd like to make any changes to the tests we currently have, here are some things to keep in mind.
+1. Clone TFB.
 
-### Updating Dependencies
+        $ git clone https://github.com/TechEmpower/FrameworkBenchmarks.git
 
-If you're updating a dependency of a framework that uses a dependency management system (Bundler, npm, etc.), please be specific with the version number that you are updating to.
+2. Run a test.
 
-Also, if you do change the dependency of any test, please update the README file for that test to reflect that change, we want to try and keep the README files as up to date as possible.
+        $ ./tfb --mode verify --test gemini
 
-### Updating Software
+### Explanation of the `./tfb` script
 
-If you would like to update any of the software used, again, please be as specific as possible, while we still install some software via apt-get and don't specify a version, we would like to have as much control over the versions as possible.
+The run script is pretty wordy, but each and every flag is required. If you are using windows, either adapt the docker command at the end of the `./tfb` shell script (replacing `${SCRIPT_ROOT}` with `/c/path/to/FrameworkBenchmarks`), or use vagrant.
 
-The main file that installs all the software is in `toolset/setup/linux/installer.py`. It's broken up into two sections, server software and client software.
+The command looks like this: `docker run -it --rm --network tfb -v /var/run/docker.sock:/var/run/docker.sock -v [FWROOT]:/FrameworkBenchmarks techempower/tfb [ARGS]`
 
-Additionally, it may be necessary to update the setup.py file in the framework's directory to use this new version.
+- `-it` tells docker to run this in 'interactive' mode and simulate a TTY, so that `ctrl+c` is propagated.
+- `--rm` tells docker to remove the container as soon as the toolset finishes running, meaning there aren't hundreds of stopped containers lying around.
+- `--network=tfb` tells the container to join the 'tfb' Docker virtual network
+- The first `-v` specifies which Docker socket path to mount as a volume in the running container. This allows docker commands run inside this container to use the host container's docker to create/run/stop/remove containers.
+- The second `-v` mounts the FrameworkBenchmarks source directory as a volume to share with the container so that rebuilding the toolset image is unnecessary and any changes you make on the host system are available in the running toolset container.
+- `techempower/tfb` is the name of toolset container to run
 
-If you update any software, please update the README files of any tests that use that software.
+#### A note on Windows:
 
-## Adding Frameworks
+- Docker expects Linux-style paths. If you cloned on your `C:\` drive, then `[ABS PATH TO THIS DIR]` would be `/c/FrameworkBenchmarks`.
+- [Docker for Windows](https://www.docker.com/docker-windows) understands `/var/run/docker.sock` even though that is not a valid path on Windows, but only when using Linux containers (it doesn't work with Windows containers and LCOW). [Docker Toolbox](https://docs.docker.com/toolbox/toolbox_install_windows/) **may** not understand `/var/run/docker.sock`, even when using Linux containers - use at your own risk.
 
-When adding a new framework or new test to an existing framework, please follow these steps:
+## Quick Start Guide (Vagrant)
 
-* Update/add [benchmark_config](#the-benchmark_config-file)
-* Update/add [setup file](#setup-files)
-* When creating a database test, please use the MySQL table hello_world.World, or the MongoDB collection hello_world.world
+Get started developing quickly by utilizing vagrant with TFB. [Git](https://git-scm.com), 
+[Virtualbox](https://www.virtualbox.org/) and [vagrant](https://www.vagrantup.com/) are 
+required.
 
-There are three different tests that we currently run:
+1. Clone TFB.
 
-* JSON Response
-* Database (single query)
-* Database (multiple query)
+        $ git clone https://github.com/TechEmpower/FrameworkBenchmarks.git
 
-The single query database test can be treated as a special case of the multiple query test with the query-count parameter set to 1.
+2. Change directories
 
-### JSON Response
+        $ cd FrameworkBenchmarks/deployment/vagrant
 
-This test needs to follow the following conventions:
+3. Build the vagrant virtual machine
 
-* The message object should be instantiated as a new object for each request.
-* The test should use a JSON serializer to render the newly instantiated object to JSON.
-* Set the response Content-Type to application/json.
-* The response should be {"message": "Hello, World!"}
-* White space in the response does not matter.
+        $ vagrant up
 
-Pseudo-code:
+4. Run a test
 
-	obj = { message : "Hello, World!" }
-	render json.encode(obj)
+        $ vagrant ssh
+        $ tfb --mode verify --test gemini
 
-### Database (single query)
 
-This test will:
+## Add a New Test
 
-* Access a database table or collection named "World" that is known to contain 10,000 rows/entries.
-* Query for a single row from the table or collection using a randomly generated id (the ids range from 1 to 10,000).
-* Set the response Content-Type to application/json.
-* Serialize the row to JSON and send the resulting string as the response.
+Either on your computer, or once you open an SSH connection to your vagrant box, start the new test initialization wizard.
 
-By convention, if the test does not use an ORM, and instead uses the raw database connectivity provided by the platform (e.g., JDBC), we append a "-raw" to the test name in the [benchmark_config](#the-benchmark_config-file) file.  For example, "php-raw".
+        vagrant@TFB-all:~/FrameworkBenchmarks$ ./tfb --new
 
-Pseudo-code:
+This will walk you through the entire process of creating a new test to include in the suite.
 
-	random_id = random(1, 10000)
-	world = World.find(random_id)
-	render json.encode(world)
 
-### Database (multiple queries)
+## Resources
 
-This test is very similar to the single query test, and in some cases it will be implemented using the same code. A URL parameter is made available to specify the number of queries to run per request. The response is a list of objects resulting from the queries for random rows.
+#### Official Documentation
+Our official documentation can be found at 
+[frameworkbenchmarks.readthedocs.org](https://frameworkbenchmarks.readthedocs.org/). 
+If you find any errors or areas for improvement within the docs, feel free to either submit a [pull request](https://github.com/TechEmpower/TFB-Documentation/pulls) or [issue](https://github.com/TechEmpower/TFB-Documentation/issues) at the [documentation repository](https://github.com/TechEmpower/TFB-Documentation).
 
-Pseudo-code:
+#### Live Results
+Results of continuous benchmarking runs are available in real time [here](https://tfb-status.techempower.com/).
 
-	number_of_queries = get("queries")
-	worlds = []
-	for i = 0; i < number_of_queries; i++
-        random_id = random(1, 10000)
-        worlds[i] = World.find(random_id)
-	render json.encode(worlds)
+#### Data Visualization
+If you have a `results.json` file that you would like to visualize, you can [do that here](https://www.techempower.com/benchmarks/#section=test). You can also attach a `runid` parameter to that url where `runid` is a run listed on [tfb-status](https://tfb-status.techempower.com) like so: https://www.techempower.com/benchmarks/#section=test&runid=fd07b64e-47ce-411e-8b9b-b13368e988c6
 
-## The benchmark_config File
+## Contributing
 
-The benchmark_config file is used by our run script to identify the available tests to be run. This file should exist at the root of the test directory. Here is its basic structure:
+The community has consistently helped in making these tests better, and we welcome any and all changes. Reviewing our contribution practices and guidelines will help to keep us all on the same page. The [contribution guide](https://frameworkbenchmarks.readthedocs.org/en/latest/Development/Contributing-Guide/) can be found in the [TFB documentation](https://frameworkbenchmarks.readthedocs.org/).
 
-	{
-      "framework": "my-framework",
-      "tests": [{
-        "default": {
-          "setup_file": "setup.py"
-          "json_url": "/json",
-          "db_url": "/db",
-          "query_url": "/db?queries=",
-          "port": 8080,
-          "sort": 32
-      }, {
-        "alternative": {
-          "setup_file": "alternate_setup.py"
-          "json_url": "/json",
-          "db_url": "/db",
-          "query_url": "/db?queries=",
-          "port": 8080,
-          "sort": 33
-        }
-      }]
-	}
-
-* framework: Specifies the framework name.
-* tests: An array of tests that can be run for this framework. In most cases, this contains a single element for the "default" test, but additional tests can be specified.
-  * setup_file: The location of the [setup file](#setup-files) that can start and stop the test. By convention this is just setup.py.
-  * json_url (optional): The relative URL path to the JSON test
-  * db_url (optional): The relative URL path to the database test
-  * query_url (optional): The relative URL path to the variable query test. The URL must be set up so that an integer can be applied to the end of the url to specify the number of queries to run, i.e. /db?queries= or /db/
-  * port: The port the server is listneing on
-  * sort: The sort order. This is important for our own blog post which relies on consistent ordering of the frameworks. You can get the next available sort order by running:
-    ./run-tests.py --next-sort
-
-## Setup Files
-
-The setup file is responsible for starting and stopping the test. This script is responsible for (among other things):
-
-* Setting the database host to the correct IP
-* Compiling/packaging the code
-* Starting the server
-* Stopping the server
-
-The setup file is a python file that contains a start() and a stop() function. Here is an example of Wicket's setup file.
-
-	import subprocess
-	import sys
-	import setup_util
-
-	##################################################
-	# start(args)
-	#
-	# Starts the server for Wicket
-	# returns 0 if everything completes, 1 otherwise
-	##################################################
-	def start(args):
-
-    # setting the database url
-    setup_util.replace_text("wicket/src/main/webapp/WEB-INF/resin-web.xml", "mysql:\/\/.*:3306", "mysql://" + args.database_host + ":3306")
-
-    # 1. Compile and package
-    # 2. Clean out possible old tests
-    # 3. Copy package to Resin's webapp directory
-    # 4. Start resin
-    try:
-      subprocess.check_call("mvn clean compile war:war", shell=True, cwd="wicket")
-      subprocess.check_call("rm -rf $RESIN_HOME/webapps/*", shell=True)
-      subprocess.check_call("cp wicket/target/hellowicket-1.0-SNAPSHOT.war $RESIN_HOME/webapps/wicket.war", shell=True)
-      subprocess.check_call("$RESIN_HOME/bin/resinctl start", shell=True)
-      return 0
-    except subprocess.CalledProcessError:
-      return 1
-
-	##################################################
-	# stop()
-	#
-	# Stops the server for Wicket
-	# returns 0 if everything completes, 1 otherwise
-	##################################################
-	def stop():
-    try:
-      subprocess.check_call("$RESIN_HOME/bin/resinctl shutdown", shell=True)
-      return 0
-    except subprocess.CalledProcessError:
-      return 1
+Join in the conversation on our [mailing list](https://groups.google.com/forum/?fromgroups=#!forum/framework-benchmarks), on [Twitter](https://twitter.com/tfbenchmarks), or chat with us on [Freenode](https://webchat.freenode.net/) at `#techempower-fwbm`. 

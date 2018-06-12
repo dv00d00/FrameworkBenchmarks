@@ -1,0 +1,10 @@
+wheezy.web
+wheezy.template
+
+SQLAlchemy
+mysqlclient
+
+gunicorn
+meinheld
+
+greenlet

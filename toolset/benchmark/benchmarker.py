@@ -1,602 +1,300 @@
-from setup.linux.installer import Installer
-from benchmark import framework_test
+from toolset.utils.output_helper import log, FNULL
+from toolset.utils.docker_helper import DockerHelper
+from toolset.utils.time_logger import TimeLogger
+from toolset.utils.metadata import Metadata
+from toolset.utils.results import Results
+from toolset.utils.audit import Audit
 
 import os
-import json
 import subprocess
-import time
-import textwrap
-import pprint
-import csv
+import traceback
 import sys
-from datetime import datetime
+import time
+import shlex
+from pprint import pprint
+
+from colorama import Fore
+
 
 class Benchmarker:
+    def __init__(self, config):
+        '''
+        Initialize the benchmarker.
+        '''
+        self.config = config
+        self.time_logger = TimeLogger()
+        self.metadata = Metadata(self)
+        self.audit = Audit(self)
 
-  ##########################################################################################
-  # Public methods
-  ##########################################################################################
+        # a list of all tests for this run
+        self.tests = self.metadata.tests_to_run()
 
-  ############################################################
-  # Prints all the available tests
-  ############################################################
-  def run_list_tests(self):
-    all_tests = self.__gather_tests()
+        self.results = Results(self)
+        self.docker_helper = DockerHelper(self)
 
-    for test in all_tests:
-      print test.name
+    ##########################################################################################
+    # Public methods
+    ##########################################################################################
 
-    self.__finish()
+    def run(self):
+        '''
+        This process involves setting up the client/server machines
+        with any necessary change. Then going through each test,
+        running their docker build and run, verifying the URLs, and
+        running benchmarks against them.
+        '''
+        # Generate metadata
+        self.metadata.list_test_metadata()
 
-  ############################################################
-  # End run_list_tests
-  ############################################################
+        any_failed = False
+        # Run tests
+        log("Running Tests...", border='=')
 
-  ############################################################
-  # Prints the metadata for all the available tests
-  ############################################################
-  def run_list_test_metadata(self):
-    all_tests = self.__gather_tests()
-    all_tests_json = json.dumps(map(lambda test: {
-      "name": test.name,
-      "approach": test.approach,
-      "classification": test.classification,
-      "database": test.database,
-      "framework": test.framework,
-      "language": test.language,
-      "orm": test.orm,
-      "platform": test.platform,
-      "webserver": test.webserver,
-      "os": test.os,
-      "database_os": test.database_os,
-      "display_name": test.display_name,
-      "notes": test.notes,
-      "versus": test.versus
-    }, all_tests))
+        # build wrk and all databases needed for current run
+        self.docker_helper.build_wrk()
+        self.docker_helper.build_databases()
 
-    with open(os.path.join(self.full_results_directory(), "test_metadata.json"), "w") as f:
-      f.write(all_tests_json)
+        with open(os.path.join(self.results.directory, 'benchmark.log'),
+                  'w') as benchmark_log:
+            for test in self.tests:
+                log("Running Test: %s" % test.name, border='-')
+                with self.config.quiet_out.enable():
+                    if not self.__run_test(test, benchmark_log):
+                        any_failed = True
+                # Load intermediate result from child process
+                self.results.load()
 
-    self.__finish()
+        # Parse results
+        if self.config.mode == "benchmark":
+            log("Parsing Results ...", border='=')
+            self.results.parse(self.tests)
 
+        self.results.set_completion_time()
+        self.results.upload()
+        self.results.finish()
 
-  ############################################################
-  # End run_list_test_metadata
-  ############################################################
-  
-  ############################################################
-  # parse_timestamp
-  # Re-parses the raw data for a given timestamp
-  ############################################################
-  def parse_timestamp(self):
-    all_tests = self.__gather_tests()
-    
-    for test in all_tests:
-      test.parse_all()
-    
-    self.__parse_results(all_tests)
+        return any_failed
 
-    self.__finish()
+    def stop(self, signal=None, frame=None):
+        log("Shutting down (may take a moment)")
+        self.docker_helper.stop()
+        sys.exit(0)
 
-  ############################################################
-  # End parse_timestamp
-  ############################################################
+    ##########################################################################################
+    # Private methods
+    ##########################################################################################
 
-  ############################################################
-  # Run the tests:
-  # This process involves setting up the client/server machines
-  # with any necessary change. Then going through each test,
-  # running their setup script, verifying the URLs, and
-  # running benchmarks against them.
-  ############################################################
-  def run(self):
-    ##########################
-    # Get a list of all known
-    # tests that we can run.
-    ##########################    
-    all_tests = self.__gather_tests()
+    def __exit_test(self, success, prefix, file, message=None):
+        if message:
+            log(message,
+                prefix=prefix,
+                file=file,
+                color=Fore.RED if success else '')
+        self.time_logger.log_test_end(log_prefix=prefix, file=file)
+        return success
 
-    ##########################
-    # Setup client/server
-    ##########################
-    print textwrap.dedent("""
-      =====================================================
-        Preparing Server, Database, and Client ...
-      =====================================================
-      """)
-    self.__setup_server()
-    self.__setup_database()
-    self.__setup_client()
+    def __run_test(self, test, benchmark_log):
+        '''
+        Runs the given test, verifies that the webapp is accepting requests,
+        optionally benchmarks the webapp, and ultimately stops all services
+        started for this test.
+        '''
 
-    ##########################
-    # Run tests
-    ##########################
-    self.__run_tests(all_tests)
+        log_prefix = "%s: " % test.name
+        # Start timing the total test duration
+        self.time_logger.mark_test_start()
 
-    ##########################
-    # Parse results
-    ##########################  
-    if self.mode == "benchmark":
-      print textwrap.dedent("""
-      =====================================================
-        Parsing Results ...
-      =====================================================
-      """)
-      self.__parse_results(all_tests)
+        # If the test is in the excludes list, we skip it
+        if self.config.exclude and test.name in self.config.exclude:
+            message = "Test {name} has been added to the excludes list. Skipping.".format(
+                name=test.name)
+            self.results.write_intermediate(test.name, message)
+            return self.__exit_test(
+                success=False,
+                message=message,
+                prefix=log_prefix,
+                file=benchmark_log)
 
-    self.__finish()
+        database_container = None
+        try:
+            # Start database container
+            if test.database.lower() != "none":
+                self.time_logger.mark_starting_database()
+                database_container = self.docker_helper.start_database(
+                    test.database.lower())
+                if database_container is None:
+                    message = "ERROR: Problem building/running database container"
+                    return self.__exit_test(
+                        success=False,
+                        message=message,
+                        prefix=log_prefix,
+                        file=benchmark_log)
+                self.time_logger.mark_started_database()
 
-  ############################################################
-  # End run
-  ############################################################
+            # Start webapp
+            container = test.start()
+            self.time_logger.mark_test_starting()
+            if container is None:
+                self.docker_helper.stop([container, database_container])
+                message = "ERROR: Problem starting {name}".format(
+                    name=test.name)
+                self.results.write_intermediate(test.name, message)
+                return self.__exit_test(
+                    success=False,
+                    message=message,
+                    prefix=log_prefix,
+                    file=benchmark_log)
 
-  ############################################################
-  # database_sftp_string(batch_file)
-  # generates a fully qualified URL for sftp to database
-  ############################################################
-  def database_sftp_string(self, batch_file):
-    sftp_string =  "sftp -oStrictHostKeyChecking=no "
-    if batch_file != None: sftp_string += " -b " + batch_file + " "
+            max_time = time.time() + 60
+            while True:
+                accepting_requests = test.is_accepting_requests()
+                if accepting_requests \
+                        or time.time() >= max_time \
+                        or not self.docker_helper.server_container_exists(container.id):
+                    break
+                time.sleep(1)
 
-    if self.database_identity_file != None:
-      sftp_string += " -i " + self.database_identity_file + " "
+            if not accepting_requests:
+                self.docker_helper.stop([container, database_container])
+                message = "ERROR: Framework is not accepting requests from client machine"
+                self.results.write_intermediate(test.name, message)
+                return self.__exit_test(
+                    success=False,
+                    message=message,
+                    prefix=log_prefix,
+                    file=benchmark_log)
 
-    return sftp_string + self.database_user + "@" + self.database_host
-  ############################################################
-  # End database_sftp_string
-  ############################################################
+            self.time_logger.mark_test_accepting_requests()
 
-  ############################################################
-  # client_sftp_string(batch_file)
-  # generates a fully qualified URL for sftp to client
-  ############################################################
-  def client_sftp_string(self, batch_file):
-    sftp_string =  "sftp -oStrictHostKeyChecking=no "
-    if batch_file != None: sftp_string += " -b " + batch_file + " "
+            # Debug mode blocks execution here until ctrl+c
+            if self.config.mode == "debug":
+                log("Entering debug mode. Server has started. CTRL-c to stop.",
+                    prefix=log_prefix,
+                    file=benchmark_log,
+                    color=Fore.YELLOW)
+                while True:
+                    time.sleep(1)
 
-    if self.client_identity_file != None:
-      sftp_string += " -i " + self.client_identity_file + " "
+            # Verify URLs and audit
+            log("Verifying framework URLs", prefix=log_prefix)
+            self.time_logger.mark_verify_start()
+            passed_verify = test.verify_urls()
+            self.audit.audit_test_dir(test.directory)
 
-    return sftp_string + self.client_user + "@" + self.client_host
-  ############################################################
-  # End client_sftp_string
-  ############################################################
+            # Benchmark this test
+            if self.config.mode == "benchmark":
+                log("Benchmarking %s" % test.name,
+                    file=benchmark_log,
+                    border='-')
+                self.time_logger.mark_benchmarking_start()
+                self.__benchmark(test, benchmark_log)
+                self.time_logger.log_benchmarking_end(
+                    log_prefix=log_prefix, file=benchmark_log)
 
-  ############################################################
-  # generate_url(url, port)
-  # generates a fully qualified URL for accessing a test url
-  ############################################################
-  def generate_url(self, url, port):
-    return self.server_host + ":" + str(port) + url
-  ############################################################
-  # End generate_url
-  ############################################################
+            # Log test timing stats
+            self.time_logger.log_build_flush(benchmark_log)
+            self.time_logger.log_database_start_time(log_prefix, benchmark_log)
+            self.time_logger.log_test_accepting_requests(
+                log_prefix, benchmark_log)
+            self.time_logger.log_verify_end(log_prefix, benchmark_log)
 
-  ############################################################
-  # output_file(test_name, test_type)
-  # returns the output file for this test_name and test_type
-  # timestamp/test_type/test_name/raw 
-  ############################################################
-  def output_file(self, test_name, test_type):
-    path = os.path.join(self.result_directory, self.timestamp, test_type, test_name, "raw")
-    try:
-      os.makedirs(os.path.dirname(path))
-    except OSError:
-      pass
-    return path
-  ############################################################
-  # End output_file
-  ############################################################
+            # Stop this test
+            self.docker_helper.stop([container, database_container])
 
-  ############################################################
-  # full_results_directory
-  ############################################################
-  def full_results_directory(self):
-    path = os.path.join(self.result_directory, self.timestamp)
-    try:
-      os.makedirs(path)
-    except OSError:
-      pass
-    return path
-  ############################################################
-  # End output_file
-  ############################################################
+            # Save results thus far into the latest results directory
+            self.results.write_intermediate(test.name,
+                                            time.strftime(
+                                                "%Y%m%d%H%M%S",
+                                                time.localtime()))
 
-  ############################################################
-  # report_results
-  ############################################################
-  def report_results(self, framework, test, results):
-    if test not in self.results['rawData'].keys():
-      self.results['rawData'][test] = dict()
+            # Upload the results thus far to another server (optional)
+            self.results.upload()
 
-    self.results['rawData'][test][framework.name] = results
+            if self.config.mode == "verify" and not passed_verify:
+                return self.__exit_test(
+                    success=False,
+                    message="Failed verify!",
+                    prefix=log_prefix,
+                    file=benchmark_log)
+        except Exception as e:
+            tb = traceback.format_exc()
+            self.results.write_intermediate(test.name,
+                                            "error during test: " + str(e))
+            log(tb, prefix=log_prefix, file=benchmark_log)
+            return self.__exit_test(
+                success=False,
+                message="Error during test: %s" % test.name,
+                prefix=log_prefix,
+                file=benchmark_log)
 
-  ############################################################
-  # End report_results
-  ############################################################
+        return self.__exit_test(
+            success=True, prefix=log_prefix, file=benchmark_log)
 
-  ##########################################################################################
-  # Private methods
-  ##########################################################################################
+    def __benchmark(self, framework_test, benchmark_log):
+        '''
+        Runs the benchmark for each type of test that it implements
+        '''
 
-  ############################################################
-  # Gathers all the tests
-  ############################################################
-  def __gather_tests(self):
-    tests = []
-    # Loop through each directory (we assume we're being run from the benchmarking root)
-    # and look for the files that signify a benchmark test
-    for dirname, dirnames, filenames in os.walk('.'):
-      # Look for the benchmark_config file, this will set up our tests.
-      # Its format looks like this:
-      #
-      # {
-      #   "framework": "nodejs",
-      #   "tests": [{
-      #     "default": {
-      #       "setup_file": "setup",
-      #       "json_url": "/json"
-      #     },
-      #     "mysql": {
-      #       "setup_file": "setup",
-      #       "db_url": "/mysql",
-      #       "query_url": "/mysql?queries="
-      #     },
-      #     ...
-      #   }]
-      # }
-      if 'benchmark_config' in filenames:
-        config = None
-        config_file_name = os.path.join(dirname, 'benchmark_config')
-        with open(config_file_name, 'r') as config_file:
-          # Load json file into config object
-          try:
-            config = json.load(config_file)
-          except:
-            print("Error loading '%s'." % config_file_name)
-            raise
+        def benchmark_type(test_type):
+            log("BENCHMARKING %s ... " % test_type.upper(), file=benchmark_log)
 
-        if config == None:
-          continue
+            test = framework_test.runTests[test_type]
+            raw_file = self.results.get_raw_file(framework_test.name,
+                                                 test_type)
+            if not os.path.exists(raw_file):
+                # Open to create the empty file
+                with open(raw_file, 'w'):
+                    pass
 
-        tests = tests + framework_test.parse_config(config, dirname[2:], self)
+            if not test.failed:
+                # Begin resource usage metrics collection
+                self.__begin_logging(framework_test, test_type)
 
-    tests.sort(key=lambda x: x.name)
-    return tests
-  ############################################################
-  # End __gather_tests
-  ############################################################
+                script = self.config.types[test_type].get_script_name()
+                script_variables = self.config.types[
+                    test_type].get_script_variables(
+                        test.name, "http://%s:%s%s" % (self.config.server_host,
+                                                       framework_test.port,
+                                                       test.get_url()))
 
-  ############################################################
-  # Makes any necessary changes to the server that should be 
-  # made before running the tests. This involves setting kernal
-  # settings to allow for more connections, or more file
-  # descriptiors
-  #
-  # http://redmine.lighttpd.net/projects/weighttp/wiki#Troubleshooting
-  ############################################################
-  def __setup_server(self):
-    try:
-      if os.name == 'nt':
-        return True
-      subprocess.check_call(["sudo","bash","-c","cd /sys/devices/system/cpu; ls -d cpu*|while read x; do echo performance > $x/cpufreq/scaling_governor; done"])
-      subprocess.check_call("sudo sysctl -w net.core.somaxconn=5000".rsplit(" "))
-      subprocess.check_call("sudo -s ulimit -n 16384".rsplit(" "))
-      subprocess.check_call("sudo sysctl net.ipv4.tcp_tw_reuse=1".rsplit(" "))
-      subprocess.check_call("sudo sysctl net.ipv4.tcp_tw_recycle=1".rsplit(" "))
-      subprocess.check_call("sudo sysctl -w kernel.shmmax=134217728".rsplit(" "))
-      subprocess.check_call("sudo sysctl -w kernel.shmall=2097152".rsplit(" "))
-    except subprocess.CalledProcessError:
-      return False
-  ############################################################
-  # End __setup_server
-  ############################################################
+                self.docker_helper.benchmark(script, script_variables,
+                                             raw_file)
 
-  ############################################################
-  # Makes any necessary changes to the database machine that 
-  # should be made before running the tests. Is very similar
-  # to the server setup, but may also include database specific
-  # changes.
-  ############################################################
-  def __setup_database(self):
-    p = subprocess.Popen(self.database_ssh_string, stdin=subprocess.PIPE, shell=True)
-    p.communicate("""
-      sudo sysctl -w net.core.somaxconn=5000
-      sudo -s ulimit -n 16384
-      sudo sysctl net.ipv4.tcp_tw_reuse=1
-      sudo sysctl net.ipv4.tcp_tw_recycle=1
-      sudo sysctl -w kernel.shmmax=2147483648
-      sudo sysctl -w kernel.shmall=2097152
-    """)
-  ############################################################
-  # End __setup_database
-  ############################################################
+                # End resource usage metrics collection
+                self.__end_logging()
 
-  ############################################################
-  # Makes any necessary changes to the client machine that 
-  # should be made before running the tests. Is very similar
-  # to the server setup, but may also include client specific
-  # changes.
-  ############################################################
-  def __setup_client(self):
-    p = subprocess.Popen(self.client_ssh_string, stdin=subprocess.PIPE, shell=True)
-    p.communicate("""
-      sudo sysctl -w net.core.somaxconn=5000
-      sudo -s ulimit -n 16384
-      sudo sysctl net.ipv4.tcp_tw_reuse=1
-      sudo sysctl net.ipv4.tcp_tw_recycle=1
-      sudo sysctl -w kernel.shmmax=2147483648
-      sudo sysctl -w kernel.shmall=2097152
-    """)
-  ############################################################
-  # End __setup_client
-  ############################################################
+            results = self.results.parse_test(framework_test, test_type)
+            log("Benchmark results:", file=benchmark_log)
+            # TODO move into log somehow
+            pprint(results)
 
-  ############################################################
-  # __run_tests
-  # Ensures that the system has all necessary software to run
-  # the tests. This does not include that software for the individual
-  # test, but covers software such as curl and weighttp that
-  # are needed.
-  ############################################################
-  def __run_tests(self, tests):
-    for test in tests:
-      if test.os.lower() != self.os.lower() or test.database_os.lower() != self.database_os.lower():
-        # the operating system requirements of this test for the
-        # application server or the database server don't match
-        # our current environment
-        continue
-      
-      # If the user specified which tests to run, then 
-      # we can skip over tests that are not in that list
-      if self.test != None and test.name not in self.test:
-        continue
-      
-      # If the test is in the excludes list, we skip it
-      if self.exclude != None and test.name in self.exclude:
-        continue
-      
-      # If the test does not contain an implementation of the current test-type, skip it
-      if self.type != 'all' and not test.contains_type(self.type):
-        continue
-      
-      print textwrap.dedent("""
-      =====================================================
-        Beginning {name}
-      -----------------------------------------------------
-      """.format(name=test.name))
+            self.results.report_benchmark_results(framework_test, test_type,
+                                                  results['results'])
+            log("Complete", file=benchmark_log)
 
-      ##########################
-      # Start this test
-      ##########################  
-      print textwrap.dedent("""
-      -----------------------------------------------------
-        Starting {name}
-      -----------------------------------------------------
-      """.format(name=test.name))
-      try:
-        p = subprocess.Popen(self.database_ssh_string, stdin=subprocess.PIPE, shell=True)
-        p.communicate("""
-          sudo restart mysql
-          sudo restart mongodb
-		  sudo /etc/init.d/postgresql restart
-        """)
-        time.sleep(10)
-        
-        result = test.start()
-        if result != 0: 
-          test.stop()
-          time.sleep(5)
-          print "ERROR: Problem starting " + test.name
-          print textwrap.dedent("""
-            -----------------------------------------------------
-              Stopped {name}
-            -----------------------------------------------------
-            """.format(name=test.name))
-          continue
-        
-        time.sleep(self.sleep)
+        for test_type in framework_test.runTests:
+            benchmark_type(test_type)
 
-        ##########################
-        # Verify URLs
-        ##########################
-        print textwrap.dedent("""
-        -----------------------------------------------------
-          Verifying URLs for {name}
-        -----------------------------------------------------
-        """.format(name=test.name))
-        test.verify_urls()
+    def __begin_logging(self, framework_test, test_type):
+        '''
+        Starts a thread to monitor the resource usage, to be synced with the
+        client's time.
+        TODO: MySQL and InnoDB are possible. Figure out how to implement them.
+        '''
+        output_file = "{file_name}".format(
+            file_name=self.results.get_stats_file(framework_test.name,
+                                                  test_type))
+        dstat_string = "dstat -Tafilmprs --aio --fs --ipc --lock --raw --socket --tcp \
+                                      --raw --socket --tcp --udp --unix --vm --disk-util \
+                                      --rpc --rpcd --output {output_file}".format(
+            output_file=output_file)
+        cmd = shlex.split(dstat_string)
+        self.subprocess_handle = subprocess.Popen(
+            cmd, stdout=FNULL, stderr=subprocess.STDOUT)
 
-        ##########################
-        # Benchmark this test
-        ##########################
-        if self.mode == "benchmark":
-          print textwrap.dedent("""
-            -----------------------------------------------------
-              Benchmarking {name} ...
-            -----------------------------------------------------
-            """.format(name=test.name))
-          test.benchmark()
-
-        ##########################
-        # Stop this test
-        ##########################
-        test.stop()
-        time.sleep(5)
-        print textwrap.dedent("""
-        -----------------------------------------------------
-          Stopped {name}
-        -----------------------------------------------------
-        """.format(name=test.name))
-        time.sleep(5)
-      except (KeyboardInterrupt, SystemExit):
-        test.stop()
-        print """
-        -----------------------------------------------------
-          Cleaning up....
-        -----------------------------------------------------
-        """
-        self.__finish()
-        sys.exit()
-    
-  ############################################################
-  # End __run_tests
-  ############################################################
-
-  ############################################################
-  # __parse_results
-  # Ensures that the system has all necessary software to run
-  # the tests. This does not include that software for the individual
-  # test, but covers software such as curl and weighttp that
-  # are needed.
-  ############################################################
-  def __parse_results(self, tests):
-    # Time to create parsed files
-    # Aggregate JSON file
-    with open(os.path.join(self.full_results_directory(), "results.json"), "w") as f:
-      f.write(json.dumps(self.results))
-    
-    # JSON CSV
-    # with open(os.path.join(self.full_results_directory(), "json.csv"), 'wb') as csvfile:
-    #  writer = csv.writer(csvfile)
-    #  writer.writerow(["Framework"] + self.concurrency_levels)
-    #  for key, value in self.results['rawData']['json'].iteritems():
-    #    framework = self.results['frameworks'][int(key)]
-    #    writer.writerow([framework] + value)
-
-    # DB CSV
-    #with open(os.path.join(self.full_results_directory(), "db.csv"), 'wb') as csvfile:
-    #  writer = csv.writer(csvfile)
-    #  writer.writerow(["Framework"] + self.concurrency_levels)
-    #  for key, value in self.results['rawData']['db'].iteritems():
-    #    framework = self.results['frameworks'][int(key)]
-    #    writer.writerow([framework] + value)
-
-    # Query CSV
-    #with open(os.path.join(self.full_results_directory(), "query.csv"), 'wb') as csvfile:
-    #  writer = csv.writer(csvfile)
-    #  writer.writerow(["Framework"] + self.query_intervals)
-    #  for key, value in self.results['rawData']['query'].iteritems():
-    #    framework = self.results['frameworks'][int(key)]
-    #    writer.writerow([framework] + value)
-
-    # Fortune CSV
-    #with open(os.path.join(self.full_results_directory(), "fortune.csv"), 'wb') as csvfile:
-    #  writer = csv.writer(csvfile)
-    #  writer.writerow(["Framework"] + self.query_intervals)
-    #  if 'fortune' in self.results['rawData'].keys():
-    #    for key, value in self.results['rawData']['fortune'].iteritems():
-    #      framework = self.results['frameworks'][int(key)]
-    #      writer.writerow([framework] + value)
-
-  ############################################################
-  # End __parse_results
-  ############################################################
-
-  ############################################################
-  # __finish
-  ############################################################
-  def __finish(self):
-    print "Time to complete: " + str(int(time.time() - self.start_time)) + " seconds"
-    print "Results are saved in " + os.path.join(self.result_directory, self.timestamp)
-
-  ############################################################
-  # End __finish
-  ############################################################
-
-  ##########################################################################################
-  # Constructor
-  ########################################################################################## 
-
-  ############################################################
-  # Initialize the benchmarker. The args are the arguments 
-  # parsed via argparser.
-  ############################################################
-  def __init__(self, args):
-    self.__dict__.update(args)
-    self.start_time = time.time()
-
-    # setup some additional variables
-    if self.database_user == None: self.database_user = self.client_user
-    if self.database_host == None: self.database_host = self.client_host
-    if self.database_identity_file == None: self.database_identity_file = self.client_identity_file
-
-    self.result_directory = os.path.join("results", self.name)
-      
-    if self.parse != None:
-      self.timestamp = self.parse
-    else:
-      self.timestamp = time.strftime("%Y%m%d%H%M%S", time.localtime())
-
-    # Setup the concurrency levels array. This array goes from
-    # starting_concurrency to max concurrency, doubling each time
-    self.concurrency_levels = []
-    concurrency = self.starting_concurrency
-    while concurrency <= self.max_concurrency:
-      self.concurrency_levels.append(concurrency)
-      concurrency = concurrency * 2
-
-    # Setup query interval array
-    # starts at 1, and goes up to max_queries, using the query_interval
-    self.query_intervals = []
-    queries = 1
-    while queries <= self.max_queries:
-      self.query_intervals.append(queries)
-      if queries == 1:
-        queries = 0
-
-      queries = queries + self.query_interval
-    
-    # Load the latest data
-    self.latest = None
-    try:
-      with open('toolset/benchmark/latest.json', 'r') as f:
-        # Load json file into config object
-        self.latest = json.load(f)
-    except IOError:
-      pass
-    
-    self.results = None
-    try:
-      if self.latest != None and self.name in self.latest.keys():
-        with open(os.path.join(self.result_directory, str(self.latest[self.name]), 'results.json'), 'r') as f:
-          # Load json file into config object
-          self.results = json.load(f)
-    except IOError:
-      pass
-    
-    if self.results == None:
-      self.results = dict()
-      self.results['concurrencyLevels'] = self.concurrency_levels
-      self.results['queryIntervals'] = self.query_intervals
-      self.results['frameworks'] = [t.name for t in self.__gather_tests()]
-      self.results['duration'] = self.duration
-      self.results['rawData'] = dict()
-      self.results['rawData']['json'] = dict()
-      self.results['rawData']['db'] = dict()
-      self.results['rawData']['query'] = dict()
-      self.results['rawData']['fortune'] = dict()
-      self.results['rawData']['update'] = dict()
-      self.results['rawData']['plaintext'] = dict()
-    else:
-      #for x in self.__gather_tests():
-      #  if x.name not in self.results['frameworks']:
-      #    self.results['frameworks'] = self.results['frameworks'] + [x.name]
-      # Always overwrite framework list
-      self.results['frameworks'] = [t.name for t in self.__gather_tests()]
-
-    # Setup the ssh command string
-    self.database_ssh_string = "ssh -T -o StrictHostKeyChecking=no " + self.database_user + "@" + self.database_host
-    self.client_ssh_string = "ssh -T -o StrictHostKeyChecking=no " + self.client_user + "@" + self.client_host
-    if self.database_identity_file != None:
-      self.database_ssh_string = self.database_ssh_string + " -i " + self.database_identity_file
-    if self.client_identity_file != None:
-      self.client_ssh_string = self.client_ssh_string + " -i " + self.client_identity_file
-
-    if self.install_software:
-      install = Installer(self)
-      install.install_software()
-
-  ############################################################
-  # End __init__
-  ############################################################
+    def __end_logging(self):
+        '''
+        Stops the logger thread and blocks until shutdown is complete.
+        '''
+        self.subprocess_handle.terminate()
+        self.subprocess_handle.communicate()
